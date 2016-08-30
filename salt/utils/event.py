@@ -112,7 +112,8 @@ TAGS = {
 
 def get_event(
         node, sock_dir=None, transport='zeromq',
-        opts=None, listen=True, io_loop=None):
+        opts=None, listen=True, io_loop=None,
+        graceful_exit=True):
     '''
     Return an event object suitable for the named transport
 
@@ -125,8 +126,8 @@ def get_event(
     # TODO: AIO core is separate from transport
     if transport in ('zeromq', 'tcp'):
         if node == 'master':
-            return MasterEvent(sock_dir, opts, listen=listen, io_loop=io_loop)
-        return SaltEvent(node, sock_dir, opts, listen=listen, io_loop=io_loop)
+            return MasterEvent(sock_dir, opts, listen=listen, io_loop=io_loop, graceful_exit=graceful_exit)
+        return SaltEvent(node, sock_dir, opts, listen=listen, io_loop=io_loop, graceful_exit=graceful_exit)
     elif transport == 'raet':
         import salt.utils.raetevent
         return salt.utils.raetevent.RAETEvent(node,
@@ -177,7 +178,8 @@ class SaltEvent(object):
     '''
     def __init__(
             self, node, sock_dir=None,
-            opts=None, listen=True, io_loop=None):
+            opts=None, listen=True, io_loop=None,
+            graceful_exit=True):
         '''
         :param IOLoop io_loop: Pass in an io_loop if you want asynchronous
                                operation for obtaining events. Eg use of
@@ -195,6 +197,7 @@ class SaltEvent(object):
         self.cpush = False
         self.subscriber = None
         self.pusher = None
+        self.graceful_exit = graceful_exit
 
         if opts is None:
             opts = {}
@@ -487,7 +490,10 @@ class SaltEvent(object):
                 mtag, data = self.unpack(raw, self.serial)
                 ret = {'data': data, 'tag': mtag}
             except KeyboardInterrupt:
-                return {'tag': 'salt/event/exit', 'data': {}}
+                if self.graceful_exit:
+                    return {'tag': 'salt/event/exit', 'data': {}}
+                else:
+                    raise KeyboardInterrupt
             except (tornado.iostream.StreamClosedError, RuntimeError):
                 return None
 
@@ -750,9 +756,9 @@ class MasterEvent(SaltEvent):
     RAET compatible
     Create a master event management object
     '''
-    def __init__(self, sock_dir, opts=None, listen=True, io_loop=None):
+    def __init__(self, sock_dir, opts=None, listen=True, io_loop=None, graceful_exit=True):
         super(MasterEvent, self).__init__(
-            'master', sock_dir, opts, listen=listen, io_loop=io_loop)
+            'master', sock_dir, opts, listen=listen, io_loop=io_loop, graceful_exit=graceful_exit)
 
 
 class LocalClientEvent(MasterEvent):
