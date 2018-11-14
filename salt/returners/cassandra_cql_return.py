@@ -61,7 +61,8 @@ Return data to a cassandra server
 
         CREATE TABLE IF NOT EXISTS salt.jids (
             jid text PRIMARY KEY,
-            load text
+            load text,
+            minions text
         );
 
         CREATE TABLE IF NOT EXISTS salt.minions (
@@ -155,6 +156,7 @@ try:
     from cassandra.connection import ConnectionException, ConnectionShutdown
     from cassandra.auth import PlainTextAuthProvider
     from cassandra.query import dict_factory
+    from cassandra import InvalidRequest
     # pylint: enable=unused-import
     HAS_CASSANDRA_DRIVER = True
 except ImportError as e:
@@ -294,8 +296,7 @@ def save_load(jid, load, minions=None):
     # cassandra_cql.cql_query may raise a CommandExecutionError
     try:
         __salt__['cassandra_cql.cql_query_with_prepare'](query, 'save_load',
-                                                         statement_arguments,
-                                                         asynchronous=True)
+                                                         statement_arguments, async=True)
     except CommandExecutionError:
         log.critical('Could not save load in jids table.')
         raise
@@ -303,12 +304,70 @@ def save_load(jid, load, minions=None):
         log.critical('Unexpected error while inserting into jids: %s', e)
         raise
 
+    # if you have a tgt, save that for the UI etc
+    if 'tgt' in load and load['tgt'] != '':
+        if minions is None:
+            ckminions = salt.utils.minions.CkMinions(__opts__)
+            # Retrieve the minions list
+            minions = ckminions.check_minions(
+                    load['tgt'],
+                    load.get('tgt_type', 'glob')
+                    )
+        # save the minions to a cache so we can see in the UI
+        try:
+            save_minions(jid, minions)
+        except InvalidRequest:
+            log.warn('minions field might not be exist, please add the field through following query.\n'
+                     'ALTER TABLE {0}.jids ADD minions text;\n'.format(_get_keyspace()), exc_info=True)
+
 
 def save_minions(jid, minions, syndic_id=None):  # pylint: disable=unused-argument
     '''
-    Included for API consistency
+    Save/update the minion list for a given jid. The syndic_id argument is
+    included for API compatibility only.
     '''
-    pass
+    query = '''UPDATE {0}.jids SET minions = ? WHERE jid = ?;'''.format(_get_keyspace())
+
+    statement_arguments = [
+        json.dumps(minions).replace("'", "''"),
+        jid,
+    ]
+
+    # cassandra_cql.cql_query may raise a CommandExecutionError
+    try:
+        __salt__['cassandra_cql.cql_query_with_prepare'](query, 'save_minions',
+                                                         statement_arguments, async=True)
+    except CommandExecutionError:
+        log.critical('Could not save minions in jids table.')
+        raise
+    except Exception as e:
+        log.critical('Unexpected error while inserting into jids: {0}'.format(str(e)))
+        raise
+
+
+def get_load_without_minions(jid):
+    '''
+    Return the load data that marks a specified jid without minions field
+    '''
+    query = '''SELECT load FROM {0}.jids WHERE jid = ?;'''.format(_get_keyspace())
+
+    ret = {}
+
+    # cassandra_cql.cql_query may raise a CommandExecutionError
+    try:
+        data = __salt__['cassandra_cql.cql_query_with_prepare'](query, 'get_load', [jid])
+        if data:
+            load = data[0].get('load')
+            if load:
+                ret = json.loads(load)
+    except CommandExecutionError:
+        log.critical('Could not get load from jids table.')
+        raise
+    except Exception as e:
+        log.critical('Unexpected error while getting load from jids: {0}'.format(str(e)))
+        raise
+
+    return ret
 
 
 # salt-run jobs.list_jobs FAILED
@@ -316,7 +375,7 @@ def get_load(jid):
     '''
     Return the load data that marks a specified jid
     '''
-    query = '''SELECT load FROM salt.jids WHERE jid = ?;'''
+    query = '''SELECT load, minions FROM {0}.jids WHERE jid = ?;'''.format(_get_keyspace())
 
     ret = {}
 
@@ -327,12 +386,25 @@ def get_load(jid):
             load = data[0].get('load')
             if load:
                 ret = salt.utils.json.loads(load)
+    except InvalidRequest:
+        log.warn('minions field might not be exist, please add the field through following query.\n'
+                 'ALTER TABLE {0}.jids ADD minions text;\n'.format(_get_keyspace()), exc_info=True)
+        ret = get_load_without_minions(jid)
     except CommandExecutionError:
         log.critical('Could not get load from jids table.')
         raise
     except Exception as e:
         log.critical('Unexpected error while getting load from jids: %s', e)
         raise
+
+    # Adds the Minions field.
+    try:
+        if 'minions' in data[0]:
+            minions = data[0].get('minions')
+            if minions:
+                ret['Minions'] = salt.utils.json.loads(minions)
+    except Exception as e:
+        log.warn('Unexpected error while getting minions from jids: {0}'.format(str(e)))
 
     return ret
 
@@ -342,7 +414,7 @@ def get_jid(jid):
     '''
     Return the information returned when the specified job id was executed
     '''
-    query = '''SELECT minion_id, full_ret FROM salt.salt_returns WHERE jid = ?;'''
+    query = '''SELECT minion_id, return FROM {0}.salt_returns WHERE jid = ?;'''.format(_get_keyspace())
 
     ret = {}
 
@@ -352,15 +424,17 @@ def get_jid(jid):
         if data:
             for row in data:
                 minion = row.get('minion_id')
-                full_ret = row.get('full_ret')
-                if minion and full_ret:
-                    ret[minion] = salt.utils.json.loads(full_ret)
+                minion_ret = row.get('return')
+                if minion and minion_ret:
+                    try:
+                        ret[minion] = {'return': json.loads(minion_ret)}
+                    except:
+                        ret[minion] = {'return': minion_ret}
     except CommandExecutionError:
         log.critical('Could not select job specific information.')
         raise
     except Exception as e:
-        log.critical(
-            'Unexpected error while getting job specific information: %s', e)
+        log.critical('Unexpected error while getting job specific information: {0}'.format(str(e)))
         raise
 
     return ret
